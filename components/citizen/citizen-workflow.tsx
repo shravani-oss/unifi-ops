@@ -14,11 +14,13 @@ import {
   Sparkles,
   ClipboardList,
   BadgeCheck,
+  AlertTriangle,
+  RefreshCw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { SourceBadge } from "@/components/status-badge"
-import { birthCertificateFields } from "@/lib/mock-data"
+import { extractDocument, toExtractedFields, ApiError, type ApiFailureKind } from "@/lib/api"
 import type { ExtractedField } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -54,18 +56,36 @@ export function CitizenWorkflow() {
   const [scanned, setScanned] = useState(false)
   const [service, setService] = useState<string | null>(null)
   const [uploaded, setUploaded] = useState(false)
+  const [file, setFile] = useState<File | null>(null)
   const [extracting, setExtracting] = useState(false)
   const [extracted, setExtracted] = useState(false)
-  const [fields, setFields] = useState<ExtractedField[]>(birthCertificateFields)
+  const [fields, setFields] = useState<ExtractedField[]>([])
+  const [failure, setFailure] = useState<ApiFailureKind | null>(null)
   const [referenceId, setReferenceId] = useState<string | null>(null)
 
-  function runExtraction() {
+  async function runExtraction() {
+    if (!file) return
     setExtracting(true)
     setExtracted(false)
-    setTimeout(() => {
-      setExtracting(false)
+    setFailure(null)
+    try {
+      // Birth/death/marriage records are all read from an identity document.
+      const result = await extractDocument(file, "id_card")
+      setFields(toExtractedFields(result.data))
       setExtracted(true)
-    }, 1800)
+    } catch (error) {
+      setFailure(error instanceof ApiError ? error.kind : "server")
+    } finally {
+      setExtracting(false)
+    }
+  }
+
+  function chooseFile(picked: File | null) {
+    setFile(picked)
+    setUploaded(picked !== null)
+    setExtracted(false)
+    setFailure(null)
+    setFields([])
   }
 
   function updateField(key: string, value: string) {
@@ -234,13 +254,15 @@ export function CitizenWorkflow() {
                   uploaded ? "border-success/50 bg-success/5" : "border-border bg-muted/40 hover:bg-muted/60",
                 )}
               >
-                {uploaded ? (
+                {uploaded && file ? (
                   <>
                     <div className="flex items-center gap-2 text-success-strong">
                       <FileText className="size-6" />
-                      <span className="font-medium">aadhaar_front.jpg</span>
+                      <span className="font-medium">{file.name}</span>
                     </div>
-                    <span className="text-sm text-muted-foreground">Uploaded · 1.2 MB · ready for extraction</span>
+                    <span className="text-sm text-muted-foreground">
+                      Ready for extraction · {(file.size / 1024).toFixed(0)} KB
+                    </span>
                   </>
                 ) : (
                   <>
@@ -254,18 +276,13 @@ export function CitizenWorkflow() {
                 <input
                   type="file"
                   className="sr-only"
-                  onChange={() => setUploaded(true)}
-                  accept="image/*,application/pdf"
+                  onChange={(e) => chooseFile(e.target.files?.[0] ?? null)}
+                  accept="image/png,image/jpeg,application/pdf"
                 />
               </label>
-              {!uploaded && (
-                <p className="mt-3 text-center text-sm text-muted-foreground">
-                  No document handy?{" "}
-                  <button className="font-medium text-accent-foreground underline" onClick={() => setUploaded(true)}>
-                    Use a sample Aadhaar
-                  </button>
-                </p>
-              )}
+              <p className="mt-3 text-center text-xs text-muted-foreground">
+                Your document is read once to fill the form. Nothing is submitted until you confirm.
+              </p>
             </div>
           )}
 
@@ -278,7 +295,7 @@ export function CitizenWorkflow() {
                 desc="We extract details and populate your form. You can review and edit everything in the next step."
               />
               <div className="mt-6">
-                {!extracted && !extracting && (
+                {!extracted && !extracting && !failure && (
                   <Button onClick={runExtraction}>
                     <Sparkles />
                     Start extraction
@@ -287,9 +304,10 @@ export function CitizenWorkflow() {
                 {extracting && (
                   <div className="flex flex-col items-center gap-3 py-6 text-muted-foreground">
                     <Loader2 className="size-8 animate-spin text-accent-foreground" />
-                    <p className="text-sm">Extracting fields from aadhaar_front.jpg…</p>
+                    <p className="text-sm">Reading {file?.name ?? "your document"}…</p>
                   </div>
                 )}
+                {failure && <ExtractionFailure kind={failure} onRetry={runExtraction} />}
                 {extracted && (
                   <div className="mx-auto max-w-md rounded-xl border border-success/30 bg-success/5 p-5 text-left">
                     <p className="flex items-center gap-2 font-medium text-success-strong">
@@ -432,6 +450,59 @@ function StepHeading({ icon: Icon, title, desc }: { icon: typeof QrCode; title: 
       </div>
       <h2 className="text-lg font-semibold tracking-tight">{title}</h2>
       <p className="max-w-md text-pretty text-sm text-muted-foreground">{desc}</p>
+    </div>
+  )
+}
+
+/**
+ * What the citizen sees when the AI cannot read the document. Each case names a
+ * cause and an action — a generic "something went wrong" would leave them stuck.
+ */
+function ExtractionFailure({ kind, onRetry }: { kind: ApiFailureKind; onRetry: () => void }) {
+  const config = {
+    "rate-limit": {
+      title: "The reader is busy right now",
+      desc: "Too many documents are being processed at once. Waiting a moment and trying again usually works.",
+      retry: true,
+    },
+    unreadable: {
+      title: "We couldn't read this document",
+      desc: "The image may be blurry, cropped, or too dark. Try a clearer photo with all four corners visible — or continue and type your details in yourself.",
+      retry: true,
+    },
+    unsupported: {
+      title: "That file type isn't supported",
+      desc: "Please upload a PNG, JPG, or PDF.",
+      retry: false,
+    },
+    offline: {
+      title: "Can't reach the document service",
+      desc: "Check your connection and try again. Your upload has not been lost.",
+      retry: true,
+    },
+    server: {
+      title: "Something went wrong while reading",
+      desc: "This is on our side, not yours. Try again, or continue and fill the form in manually.",
+      retry: true,
+    },
+  }[kind]
+
+  return (
+    <div
+      role="alert"
+      className="mx-auto max-w-md rounded-xl border border-warning/40 bg-warning/8 p-5 text-left"
+    >
+      <p className="flex items-center gap-2 font-medium text-warning-foreground">
+        <AlertTriangle className="size-5" aria-hidden />
+        {config.title}
+      </p>
+      <p className="mt-2 text-sm text-muted-foreground">{config.desc}</p>
+      {config.retry && (
+        <Button variant="outline" size="sm" className="mt-3" onClick={onRetry}>
+          <RefreshCw className="size-4" aria-hidden />
+          Try again
+        </Button>
+      )}
     </div>
   )
 }

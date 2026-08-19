@@ -11,18 +11,56 @@ import {
   Download,
   Loader2,
   RotateCcw,
+  AlertTriangle,
 } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { SourceBadge, ConfidenceMeter } from "@/components/status-badge"
-import { workflowFields, type AutomationWorkflow } from "@/lib/business-data"
-import { downloadCsv } from "@/lib/export"
+import { type AutomationWorkflow, type WorkflowKey } from "@/lib/business-data"
+import {
+  extractDocument,
+  toExtractedFields,
+  generateVoucher,
+  ApiError,
+  type ApiFailureKind,
+  type BackendDocumentType,
+} from "@/lib/api"
 import type { ExtractedField } from "@/lib/types"
 import { cn } from "@/lib/utils"
+
+/** Each automation reads a different kind of source document. */
+const workflowDocumentType: Record<WorkflowKey, BackendDocumentType> = {
+  expense: "receipt",
+  invoice: "invoice",
+  purchase: "invoice",
+  vendor: "vendor_doc",
+  po: "invoice",
+}
 
 type Stage = "capture" | "extracting" | "verify" | "done"
 
 const STEPS = ["Capture", "Extract", "Verify", "Generate"] as const
+
+/** Shown when the backend cannot read an uploaded document. */
+function ExtractionFailure({ kind }: { kind: ApiFailureKind }) {
+  const message = {
+    "rate-limit": "The document reader is at capacity right now. Wait a few seconds and upload again.",
+    unreadable: "We couldn't read any text from that file. Try a clearer scan or a higher-resolution image.",
+    unsupported: "That file type isn't supported. Upload a PDF, JPG, or PNG.",
+    offline: "Can't reach the document service. Check that the backend is running.",
+    server: "Something went wrong while reading the document. Please try again.",
+  }[kind]
+
+  return (
+    <div
+      role="alert"
+      className="mx-auto mt-4 flex max-w-lg items-start gap-2.5 rounded-xl border border-warning/40 bg-warning/8 p-4 text-left"
+    >
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning-foreground" aria-hidden />
+      <p className="text-sm text-muted-foreground">{message}</p>
+    </div>
+  )
+}
 
 export function DocumentFlow({
   workflow,
@@ -32,16 +70,27 @@ export function DocumentFlow({
   onClose: () => void
 }) {
   const [stage, setStage] = useState<Stage>("capture")
-  const fields = workflowFields[workflow.key]
+  const [fields, setFields] = useState<ExtractedField[]>([])
+  const [file, setFile] = useState<File | null>(null)
+  const [failure, setFailure] = useState<ApiFailureKind | null>(null)
   const missing = fields.filter((f) => f.source === "missing")
   const [inputs, setInputs] = useState<Record<string, string>>({})
 
   const activeStep =
     stage === "capture" ? 0 : stage === "extracting" ? 1 : stage === "verify" ? 2 : 3
 
-  function runExtraction() {
+  async function runExtraction(picked: File) {
+    setFile(picked)
     setStage("extracting")
-    setTimeout(() => setStage("verify"), 1900)
+    setFailure(null)
+    try {
+      const result = await extractDocument(picked, workflowDocumentType[workflow.key])
+      setFields(toExtractedFields(result.data))
+      setStage("verify")
+    } catch (error) {
+      setFailure(error instanceof ApiError ? error.kind : "server")
+      setStage("capture")
+    }
   }
 
   const canGenerate = missing.every((f) => (inputs[f.key] ?? "").trim().length > 0)
@@ -59,17 +108,33 @@ export function DocumentFlow({
     f.source === "missing" && inputs[f.key] ? { ...f, value: inputs[f.key], source: "manual" } : f,
   )
 
-  function downloadRecord() {
-    downloadCsv<ExtractedField>(
-      `${reference}_${workflow.generates.replace(/\s+/g, "_")}.csv`,
-      [
-        { key: "label", label: "Field", value: (f) => f.label },
-        { key: "value", label: "Value", value: (f) => f.value },
-        { key: "source", label: "Source", value: (f) => f.source },
-        { key: "confidence", label: "AI confidence", value: (f) => f.confidence ?? "" },
-      ],
-      record,
-    )
+  const [downloading, setDownloading] = useState(false)
+  const [downloadError, setDownloadError] = useState<string | null>(null)
+
+  /** Asks the backend to render the record as a PDF voucher and saves it. */
+  async function downloadRecord() {
+    setDownloading(true)
+    setDownloadError(null)
+    try {
+      const byKey = Object.fromEntries(record.map((f) => [f.key, f.value]))
+      const blob = await generateVoucher({ ...byKey, transaction_id: reference })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = url
+      link.download = `${reference}_${workflow.generates.replace(/\s+/g, "_")}.pdf`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      setDownloadError(
+        error instanceof ApiError && error.kind === "offline"
+          ? "Can't reach the document service."
+          : "Could not generate the PDF. Try again.",
+      )
+    } finally {
+      setDownloading(false)
+    }
   }
 
   return (
@@ -141,12 +206,22 @@ export function DocumentFlow({
               </p>
               <div className="mt-6 rounded-xl border-2 border-dashed border-border bg-muted/40 px-6 py-10">
                 <p className="text-sm text-muted-foreground">Drag &amp; drop, or</p>
-                <Button className="mt-3" onClick={runExtraction}>
-                  <UploadCloud className="size-4" />
+                <label className="mt-3 inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-primary px-2.5 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/80 focus-within:ring-3 focus-within:ring-ring/50">
+                  <UploadCloud className="size-4" aria-hidden />
                   {workflow.captureLabel}
-                </Button>
+                  <input
+                    type="file"
+                    className="sr-only"
+                    accept="image/png,image/jpeg,application/pdf"
+                    onChange={(e) => {
+                      const picked = e.target.files?.[0]
+                      if (picked) runExtraction(picked)
+                    }}
+                  />
+                </label>
                 <p className="mt-3 text-xs text-muted-foreground">PDF, JPG or PNG · up to 10 MB</p>
               </div>
+              {failure && <ExtractionFailure kind={failure} />}
             </div>
           </Card>
         )}
@@ -159,7 +234,7 @@ export function DocumentFlow({
               </div>
               <h3 className="mt-5 text-lg font-semibold">Reading your document…</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                Extracting {workflow.title === "Expense Claim" ? "merchant, date, amount, tax and category" : "the key details"}.
+                Extracting the key details from {file?.name ?? "your upload"}.
               </p>
             </div>
           </Card>
@@ -247,18 +322,23 @@ export function DocumentFlow({
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium">
-                    {reference}_{workflow.generates.replace(/\s+/g, "_")}.csv
+                    {reference}_{workflow.generates.replace(/\s+/g, "_")}.pdf
                   </p>
                   <p className="text-xs text-muted-foreground">Standardized · generated just now</p>
                 </div>
-                <Button variant="outline" size="sm" onClick={downloadRecord}>
-                  <Download className="size-4" />
-                  Download
+                <Button variant="outline" size="sm" onClick={downloadRecord} disabled={downloading}>
+                  {downloading ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
+                  {downloading ? "Generating…" : "Download"}
                 </Button>
               </div>
+              {downloadError && (
+                <p role="alert" className="mt-2 text-xs text-destructive-strong">
+                  {downloadError}
+                </p>
+              )}
 
               <div className="mt-6 flex items-center justify-center gap-3">
-                <Button variant="outline" onClick={() => { setStage("capture"); setInputs({}); setReference("") }}>
+                <Button variant="outline" onClick={() => { setStage("capture"); setInputs({}); setReference(""); setFields([]); setFile(null); setFailure(null) }}>
                   <RotateCcw className="size-4" />
                   New {workflow.title.toLowerCase()}
                 </Button>
